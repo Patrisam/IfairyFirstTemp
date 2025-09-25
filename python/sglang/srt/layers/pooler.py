@@ -40,23 +40,30 @@ class Pooler(nn.Module):
         self.normalize = normalize
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self, hidden_states_real: torch.Tensor, hidden_states_imag: torch.Tensor, forward_batch: ForwardBatch
     ) -> EmbeddingPoolerOutput:
         if self.pooling_type == PoolingType.LAST:
             last_token_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-            pooled_data = hidden_states[last_token_indices]
+            pooled_data_real = hidden_states_real[last_token_indices]
+            pooled_data_imag = hidden_states_imag[last_token_indices]
         elif self.pooling_type == PoolingType.CLS:
             prompt_lens = forward_batch.extend_seq_lens
             first_token_flat_indices = torch.zeros_like(prompt_lens)
             first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
-            pooled_data = hidden_states[first_token_flat_indices]
+            pooled_data_real = hidden_states_real[first_token_flat_indices]
+            pooled_data_imag = hidden_states_imag[first_token_flat_indices]
         else:
             raise ValueError(f"Invalid pooling type: {self.pooling_type}")
 
         if self.normalize:
-            pooled_data = nn.functional.normalize(pooled_data, p=2, dim=1)
+            pooled_data_real = nn.functional.normalize(pooled_data_real, p=2, dim=1)
+            pooled_data_imag = nn.functional.normalize(pooled_data_imag, p=2, dim=1)
+
+        # Combine real and imaginary parts into a complex tensor
+        pooled_data = torch.complex(pooled_data_real, pooled_data_imag)
 
         return EmbeddingPoolerOutput(embeddings=pooled_data)
+
 
 
 class CrossEncodingPooler(nn.Module):

@@ -6,6 +6,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
+import torch.nn.functional as F
 
 from sglang.srt.distributed import (
     divide,
@@ -496,7 +497,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
 
 class ParallelLMHead(VocabParallelEmbedding):
-    """Parallelized LM head.
+    """Parallelized LM head for complex numbers.
 
     Output logits weight matrices used in the Sampler. The weight and bias
     tensors are padded to make sure they are divisible by the number of
@@ -566,6 +567,25 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.weight = embed_tokens.weight
             return self
 
-    def forward(self, input_):
-        del input_
-        raise RuntimeError("LMHead's weights should be used in the sampler.")
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        """Handle complex input and apply the LMHead transformation."""
+        
+        if input_.is_complex():
+            # Separate real and imaginary parts of the input
+            input_real = input_.real
+            input_imag = input_.imag
+            
+            # Apply linear transformation on real and imaginary parts separately
+            real_out = F.linear(input_real, self.weight_real) - F.linear(input_imag, self.weight_imag)
+            imag_out = F.linear(input_real, self.weight_imag) + F.linear(input_imag, self.weight_real)
+            
+            # Return complex output (real_out becomes the real part, imag_out becomes the imaginary part)
+            return torch.complex(real_out, imag_out)
+        else:
+            # For real inputs, simply apply the regular projection
+            out = F.linear(input_, self.weight)
+            if self.bias is not None:
+                out += self.bias
+            return out
+
+

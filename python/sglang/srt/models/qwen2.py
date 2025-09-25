@@ -177,7 +177,8 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        # Use the QKVParallelLinear for the projection
+        qkv, _ = self.qkv_proj(hidden_states)  # Using the complex QKV projection
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
