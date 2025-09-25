@@ -104,7 +104,7 @@ class Relu2AndMul(CustomOp):
         gate =x [..., d: ]
         act = torch.relu(act) ** 2
         x = act * gate 
-        return  x
+        return  x    
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2 
