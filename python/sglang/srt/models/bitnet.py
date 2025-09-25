@@ -118,6 +118,7 @@ class Relu2AndMul(CustomOp):
 class BitNetMLP(nn.Module):
     def __init__(
         self,
+        config : BitNetConfig ,
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
@@ -125,6 +126,7 @@ class BitNetMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -148,7 +150,8 @@ class BitNetMLP(nn.Module):
             f"Unsupported activation: {hidden_act}. "
             "Only silu or relu2 is supported for now."
             )
-        self.mlp_norm = BitNetRMSNorm(hidden_size=intermediate_size)
+        self.rms_norm_eps = self.config.rms_norm_eps
+        self.mlp_norm =RMSNorm(hidden_size=intermediate_size,eps=self.rms_norm_eps)
         
     #    self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
@@ -157,7 +160,9 @@ class BitNetMLP(nn.Module):
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+        
         x  = self.mlp_norm(x)
+        
         x, _ = self.down_proj(x)
         return x
 
@@ -186,6 +191,7 @@ class BitNetRMSNorm(nn.Module):
 class BitNetAttention(nn.Module):
     def __init__(
         self,
+        config: BitNetConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -196,6 +202,7 @@ class BitNetAttention(nn.Module):
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
+        
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -207,7 +214,14 @@ class BitNetAttention(nn.Module):
         self.total_num_kv_heads = num_kv_heads
         
         self.output_last_size = self.num_heads * self.head_dim
-        self.attn_norm =  BitNetRMSNorm(hidden_size=self.output_last_size)
+        
+        
+        self.rms_norm_eps = config.rms_norm_eps
+#        self.attn_norm =  BitNetRMSNorm(hidden_size=self.output_last_size)
+        self.attn_norm = RMSNorm(hidden_size=self.output_last_size,eps=self.rms_norm_eps)
+        
+        
+        
         
         
         if self.total_num_kv_heads >= tp_size:
@@ -274,9 +288,9 @@ class BitNetAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        
-             
+                    
         norm_output = self.attn_norm(attn_output)
+               
         output, _ = self.o_proj(norm_output)
         
         return output
@@ -292,6 +306,7 @@ class BitNetDecoderLayer(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
+        self.config =config
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -300,7 +315,9 @@ class BitNetDecoderLayer(nn.Module):
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
+        
         self.self_attn = BitNetAttention(
+            config= self.config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -314,6 +331,7 @@ class BitNetDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = BitNetMLP(
+            config = self.config,
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
