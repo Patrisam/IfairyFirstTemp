@@ -748,25 +748,87 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             tp_size=self.tp_size,
         )
 
-class ComplexWeightQuantizer:
-    def __init__(self, quant_config=None):
-        self.quant_config = quant_config
+class DirectionQuantSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, w_real: torch.Tensor, w_imag: torch.Tensor):
+        phase = torch.angle(w_real + 1j * w_imag)
+        real_pos = (phase >= -torch.pi / 4) & (phase < torch.pi / 4)
+        real_neg = (phase >= 3 * torch.pi / 4) | (phase < -3 * torch.pi / 4)
+        imag_pos = (phase >= torch.pi / 4) & (phase < 3 * torch.pi / 4)
+        imag_neg = (phase >= -3 * torch.pi / 4) & (phase < -torch.pi / 4)
+        real_scale = 1.0 / torch.clamp(w_real[real_pos|real_neg].abs().mean(), min=1e-5)
+        imag_scale = 1.0 / torch.clamp(w_imag[imag_pos|imag_neg].abs().mean(), min=1e-5)
         
-    def __call__(self, weight_real, weight_imag):
-        # Quantize the real and imaginary parts of the weight
-        return weight_real, weight_imag  # Placeholder for actual quantization logic
+        qw_real = torch.zeros_like(w_real)
+        qw_imag = torch.zeros_like(w_imag)
 
-class ComplexActivationQuantizer:
-    def __init__(self, quant_config=None):
-        self.quant_config = quant_config
-    
-    def __call__(self, x_real, x_imag):
-        # Quantize the real and imaginary parts of the activation
-        return x_real, x_imag  # Placeholder for actual quantization logic
+        qw_real[real_pos] = 1.0
+        qw_imag[imag_pos] = 1.0
+        qw_real[real_neg] = -1.0
+        qw_imag[imag_neg] = -1.0
 
-# Utility function for dividing numbers
-def divide(a, b):
-    return a // b if a % b == 0 else a // b + 1
+        qw_real = qw_real / real_scale
+        qw_imag = qw_imag / imag_scale
+
+        return qw_real, qw_imag
+
+    @staticmethod
+    def backward(ctx, grad_real, grad_imag):
+        return grad_real, grad_imag
+
+
+def weight_quant_qat(w_real: torch.Tensor, w_imag: torch.Tensor):
+    return DirectionQuantSTE.apply(w_real, w_imag)
+
+
+class ComplexWeightQuantizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, w_real, w_imag):
+        return weight_quant_qat(w_real, w_imag)
+
+
+class ActivationQuantSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x_real: torch.Tensor, x_imag: torch.Tensor):
+        real_scale = 127.0 / x_real.abs().max(dim=-1, keepdim=True).values.clamp_(
+            min=1e-5
+        )
+        imag_scale = 127.0 / x_imag.abs().max(dim=-1, keepdim=True).values.clamp_(
+            min=1e-5
+        )
+
+        qx_real = x_real * real_scale
+        qx_real = qx_real.contiguous()
+        qx_real.round_()
+        qx_real.clamp_(-128, 127)
+        qx_real.div_(real_scale)
+
+        qx_imag = x_imag * imag_scale
+        qx_imag = qx_imag.contiguous()
+        qx_imag.round_()
+        qx_imag.clamp_(-128, 127)
+        qx_imag.div_(imag_scale)
+
+        return qx_real, qx_imag
+
+    @staticmethod
+    def backward(ctx, grad_real, grad_imag):
+        # STE
+        return grad_real, grad_imag
+
+
+def activation_quant_qat(x_real: torch.Tensor, x_imag: torch.Tensor):
+    return ActivationQuantSTE.apply(x_real, x_imag)
+
+
+class ComplexActivationQuantizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x_real, x_imag):
+        return activation_quant_qat(x_real, x_imag)
 
 class QKVParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation with complex numbers, quantization, and proper addition and subtraction."""

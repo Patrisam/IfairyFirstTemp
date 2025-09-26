@@ -28,7 +28,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_janus_pro import DropPath
 from sglang.srt.models.gpt_oss import GptOssForCausalLM
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
-from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from python.sglang.srt.models.ifairy import Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.utils import logger

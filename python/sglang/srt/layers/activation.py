@@ -58,79 +58,59 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
-class SiluAndMul(CustomOp):
+import torch
+import torch.nn.functional as F
+
+class Relu2AndMul(CustomOp):
+    """
+    复数 ReLU² 激活：
+      - 复数输入：对 (x_real, x_imag) 做 “(real<0 & imag<0) 置零”，然后分别平方
+      - 实数输入：ReLU 后平方
+    注：为保证 in-place 且不破坏 autograd，若需要梯度则先 clone 一份再原地改。
+    """
+
+    @staticmethod
+    def _complex_relu2_inplace(x_real: torch.Tensor, x_imag: torch.Tensor):
+        # 若需要梯度，clone 后再做 in-place 修改
+        if x_real.requires_grad or x_imag.requires_grad:
+            x_real = x_real.clone()
+            x_imag = x_imag.clone()
+
+        mask = (x_real < 0) & (x_imag < 0)
+        x_real[mask] = 0
+        x_imag[mask] = 0
+        x_real.pow_(2)
+        x_imag.pow_(2)
+        return x_real, x_imag
+
+    @staticmethod
+    def _real_relu2_inplace(x: torch.Tensor):
+        out = x.clone() if x.requires_grad else x
+        out.clamp_min_(0)
+        out.pow_(2)
+        return out
+
+    # 统一的纯 PyTorch 实现
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        # Check if the input tensor is complex
         if x.is_complex():
-            real_part = x.real
-            imag_part = x.imag
-            # Apply Silu activation on real part and multiply by imag part
-            real_out = F.silu(real_part) * imag_part
-            # Return complex tensor (real_out becomes the real part, imag_part stays the same)
-            return torch.complex(real_out, imag_part)
+            xr, xi = self._complex_relu2_inplace(x.real, x.imag)
+            return torch.complex(xr, xi)
         else:
-            # If not complex, process as normal
-            d = x.shape[-1] // 2
-            return F.silu(x[..., :d]) * x[..., d:]
+            return self._real_relu2_inplace(x)
+
+    # 各设备分支：目前都用同一数学实现；若有设备专用 kernel，可在此替换
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        if x.is_complex():
-            real_part = x.real
-            imag_part = x.imag
-            output_shape = x.shape[:-1] + (real_part.shape[-1],)  # Same shape for real part
-            out_real = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-            out_imag = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-            silu_and_mul(x, out_real)  # Apply on real part
-            out_imag.copy_(imag_part)  # Copy the imaginary part directly
-            return torch.complex(out_real, out_imag)
-        else:
-            d = x.shape[-1] // 2
-            output_shape = x.shape[:-1] + (d,)
-            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-            silu_and_mul(x, out)
-            return out
-
-    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        if x.is_complex():
-            real_part = x.real
-            imag_part = x.imag
-            # Apply Silu on real part and multiply by imag part
-            real_out = F.silu(real_part) * imag_part
-            return torch.complex(real_out, imag_part)
-        else:
-            if _is_cpu_amx_available:
-                out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)
-                return out
-            else:
-                return self.forward_native(x)
+        return self.forward_native(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        if x.is_complex():
-            real_part = x.real
-            imag_part = x.imag
-            # Apply Silu on real part and multiply by imag part
-            real_out = torch_npu.npu_swiglu(real_part)
-            return torch.complex(real_out, imag_part)
-        else:
-            out = torch_npu.npu_swiglu(x)
-            return out
+        return self.forward_native(x)
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        if x.is_complex():
-            real_part = x.real
-            imag_part = x.imag
-            output_shape = x.shape[:-1] + (real_part.shape[-1],)  # Same shape for real part
-            out_real = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-            out_imag = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-            silu_and_mul(x, out_real)  # Apply on real part
-            out_imag.copy_(imag_part)  # Copy the imaginary part directly
-            return torch.complex(out_real, out_imag)
-        else:
-            d = x.shape[-1] // 2
-            output_shape = x.shape[:-1] + (d,)
-            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-            silu_and_mul(x, out)
-            return out
+        return self.forward_native(x)
+
 
 
 

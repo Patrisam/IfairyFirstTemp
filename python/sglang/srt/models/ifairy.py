@@ -20,13 +20,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from torch import Tensor
 
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.activation import Relu2AndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -51,13 +52,17 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import add_prefix, make_layers
 
-Qwen2Config = None
-
+IfairyCOnfig =None
 
 logger = logging.getLogger(__name__)
 
 
-class Qwen2MLP(nn.Module):
+import torch
+import torch.nn as nn
+from torch import Tensor
+from typing import Optional
+
+class IfairyMLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -67,12 +72,21 @@ class Qwen2MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+
+        # 线性变换：gate_up_proj 和 up_proj
+        self.gate_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+        )
+        self.up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -81,21 +95,72 @@ class Qwen2MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
-        if hidden_act != "silu":
+
+        # 激活函数：ReLU²
+        if hidden_act != "relu2":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only relu2 is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        self.act_fn = ReLU2()
 
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        # 正则化层：ComplexNetRMSNorm (复数版本的 RMSNorm)
+        self.mlp_norm = ComplexNetRMSNorm(intermediate_size, eps=1e-6)
+
+    def forward(self, x_real: Tensor, x_imag: Tensor) -> Tensor:
+        # 线性变换：gate_up_proj
+        gate_proj_real, gate_proj_imag = self.gate_proj(x_real, x_imag)
+
+        # 激活函数：复数 ReLU²
+        activated_real, activated_imag = self.act_fn(gate_proj_real, gate_proj_imag)
+
+        # 线性变换：up_proj
+        up_proj_real, up_proj_imag = self.up_proj(x_real, x_imag)
+
+        # ReLU² 门控后的融合操作（复数乘法）
+        up_proj_activated_real = (
+            activated_real * up_proj_real + activated_imag * up_proj_imag
+        )
+        up_proj_activated_imag = (
+            activated_real * up_proj_imag - activated_imag * up_proj_real
+        )
+
+        # 使用复数正则化：ComplexNetRMSNorm
+        ln_real, ln_imag = self.mlp_norm(up_proj_activated_real, up_proj_activated_imag)
+
+        # 线性变换：down_proj
+        out_real, out_imag = self.down_proj(ln_real, ln_imag)
+
+        return out_real, out_imag
+
+class ComplexNetRMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight_real = nn.Parameter(torch.ones(hidden_size))
+        self.weight_imag = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(
+        self, hidden_states_real: torch.Tensor, hidden_states_imag: torch.Tensor
+    ):
+        input_dtype = hidden_states_real.dtype
+
+        hidden_states_real.to(torch.float32)
+        hidden_states_imag.to(torch.float32)
+        magnitude = torch.mean(
+            hidden_states_real**2 + hidden_states_imag**2, dim=-1, keepdim=True
+        )
+        variance = torch.rsqrt(magnitude + self.variance_epsilon)
+
+        hidden_states_real = hidden_states_real * variance
+        hidden_states_imag = hidden_states_imag * variance
+
+        rmsnorm_out_real = self.weight_real * hidden_states_real
+        rmsnorm_out_imag = self.weight_imag * hidden_states_imag
+
+        return rmsnorm_out_real.to(input_dtype), rmsnorm_out_imag.to(input_dtype)
 
 
-class Qwen2Attention(nn.Module):
+class IfairyAttention(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -186,10 +251,10 @@ class Qwen2Attention(nn.Module):
         return output
 
 
-class Qwen2DecoderLayer(nn.Module):
+class IfairyDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: Qwen2Config,
+        config: IfairyConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -204,7 +269,7 @@ class Qwen2DecoderLayer(nn.Module):
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
-        self.self_attn = Qwen2Attention(
+        self.self_attn = IfairyAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -217,7 +282,7 @@ class Qwen2DecoderLayer(nn.Module):
             dual_chunk_attention_config=dual_chunk_attention_config,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = Qwen2MLP(
+        self.mlp = IfairyMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -254,13 +319,13 @@ class Qwen2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen2Model(nn.Module):
+class IfairyModel(nn.Module):
     def __init__(
         self,
-        config: Qwen2Config,
+        config: IfairyConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        decoder_layer_type: type[nn.Module] = Qwen2DecoderLayer,
+        decoder_layer_type: type[nn.Module] = IfairyDecoderLayer,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
@@ -280,8 +345,8 @@ class Qwen2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        # Use the provided decoder layer type or default to Qwen2DecoderLayer
-        decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
+        # Use the provided decoder layer type or default to IfairyDecoderLayer
+        decoder_layer_type = decoder_layer_type or IfairyDecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
@@ -387,7 +452,7 @@ class Qwen2Model(nn.Module):
                 )
 
 
-class Qwen2ForCausalLM(nn.Module):
+class IfairyForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -409,7 +474,7 @@ class Qwen2ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen2Config,
+        config: IfairyConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -417,7 +482,7 @@ class Qwen2ForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen2Model(
+        self.model = IfairyModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
@@ -647,4 +712,4 @@ class Qwen2ForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-EntryClass = Qwen2ForCausalLM
+EntryClass = IfairyForCausalLM
