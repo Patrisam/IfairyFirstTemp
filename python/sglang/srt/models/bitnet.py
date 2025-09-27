@@ -61,15 +61,95 @@ Qwen2Config = None
 logger = logging.getLogger(__name__)
 
 
-'''def rule2AndMul(x:torch.Tensor,intermediate_size:int):       
-    act = x [:,:,: intermediate_size]
-    gate =x [:,:, intermediate_size: ]
-    act = torch.relu(act) ** 2
-    x = act * gate 
-    return x   '''
+ 
+    
+def quant_dequant_weight(w):
+    """
+    Per-tensor quantization to 1.58 bits. No grouping is needed for quantization.
+    Args:
+        w: a weight tensor with shape [d, k]
+    Returns:
+        u: a quantized weight with shape [d, k]
+    """
+    scale = 1.0 / w.abs().mean().clamp_(min=1e-5)
+    u = (w * scale).round().clamp_(-1, 1) / scale
+    return u    
+    
+   
+def quant_dequant_input(x):
+    """ Per-token quantization to 8 bits. No grouping is needed for quantization.
+    Args:
+        x: an activation tensor with shape [n, d]
+    Returns:
+        y: a quantized activation tensor with shape [n, d]
+    """
+    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
+    y = (x * scale).round().clamp_(-128, 127) / scale
+    return y
+ 
+
+ 
+class Bit_MergedColumnParallelLinear(MergedColumnParallelLinear):
+    def __init__(self, input_size, output_sizes, bias = True, gather_output = False, skip_bias_add = False, params_dtype = None, quant_config = None, prefix = "", tp_rank = None, tp_size = None, use_presharded_weights = False,threshold: float = 1.0):
+        super().__init__(input_size, output_sizes, bias, gather_output, skip_bias_add, params_dtype, quant_config, prefix, tp_rank, tp_size, use_presharded_weights)
+        self.register_buffer('weight_scale', torch.empty(len(self.output_sizes), dtype=self.weight.dtype, device=self.weight.device))
+    def weight_loader(self, param, loaded_weight, loaded_shard_id = None):
+        # 如果是 scale，我们自己处理这个标量
+        if param is self.weight_scale:
+            param.data[loaded_shard_id] = loaded_weight.item()
+        # 否则 (是 weight 或 bias), 交给父类处理
+        else:
+            super().weight_loader(param, loaded_weight, loaded_shard_id)
+    def forward(self, input_):
+        ori_weight = self.weight.data
+        tp_output_sizes = [size // self.tp_size for size in self.output_sizes]
+        expanded_scale = torch.repeat_interleave(
+            self.weight_scale.data,
+            torch.tensor(tp_output_sizes, device=self.weight.device)
+        ) 
+        quantized_weight = expanded_scale.unsqueeze(1)
+        
+        self.weight.data =  quantized_weight *ori_weight
+        input_ = quant_dequant_input(input_) 
+        output = super().forward(input_)
+        self.weight.data = ori_weight
+        return output 
 
 
-class Relu2AndMul(CustomOp):
+class Bit_RowParallelLinear(RowParallelLinear):
+    def __init__(self, input_size, output_size, bias = True, input_is_parallel = True, skip_bias_add = False, params_dtype = None, reduce_results = True, quant_config = None, prefix = "", tp_rank = None, tp_size = None, use_presharded_weights = False):
+        super().__init__(input_size, output_size, bias, input_is_parallel, skip_bias_add, params_dtype, reduce_results, quant_config, prefix, tp_rank, tp_size, use_presharded_weights)
+        self.register_buffer('weight_scale', torch.empty(1, dtype=self.weight.dtype,  device=self.weight.device))       
+    def weight_loader(self, param, loaded_weight):
+        if param is self.weight_scale:
+            param.data[0] = loaded_weight.item()
+        else:
+            super().weight_loader(param, loaded_weight)
+    def forward(self, input_):  
+        ori_weight = self.weight.data
+        scale_value = self.weight_scale.data        
+        self.weight.data = scale_value * ori_weight     
+        input_ = quant_dequant_input(input_)        
+        output, output_bias = super().forward(input_)       
+        self.weight.data = ori_weight       
+        return output, output_bias
+        return output 
+
+class Bit_QKVParallelLinear (QKVParallelLinear):
+    def __init__(self, hidden_size, head_size, total_num_heads, total_num_kv_heads = None, bias = True, skip_bias_add = False, params_dtype = None, quant_config = None, prefix = "", tp_rank = None, tp_size = None, load_presharded_attn = False):
+        super().__init__(hidden_size, head_size, total_num_heads, total_num_kv_heads, bias, skip_bias_add, params_dtype, quant_config, prefix, tp_rank, tp_size, load_presharded_attn)
+    def forward(self, input_):
+        ori_weight = self.weight.data
+        quantized_weight = self.weight_scale.data 
+        self.weight.data =  quantized_weight *ori_weight
+        input_ = quant_dequant_input(input_) 
+        output = super().forward(input_)
+        return output 
+
+
+ 
+
+class Relu2AndMul(CustomOp) :
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         "x shoud be (batch_size,sequence,intermediate_size*2) "
         d = x.shape[-1] // 2 
@@ -115,6 +195,10 @@ class Relu2AndMul(CustomOp):
         return  x
 
 
+ 
+
+
+
 class BitNetMLP(nn.Module):
     def __init__(
         self,
@@ -151,7 +235,7 @@ class BitNetMLP(nn.Module):
             "Only silu or relu2 is supported for now."
             )
         self.rms_norm_eps = self.config.rms_norm_eps
-        self.mlp_norm =RMSNorm(hidden_size=intermediate_size,eps=self.rms_norm_eps)
+        self.ffn_sub_norm =RMSNorm(hidden_size=intermediate_size,eps=self.rms_norm_eps)
         
     #    self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
@@ -161,7 +245,7 @@ class BitNetMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         
-        x  = self.mlp_norm(x)
+        x  = self.ffn_sub_norm(x)
         
         x, _ = self.down_proj(x)
         return x
@@ -218,7 +302,7 @@ class BitNetAttention(nn.Module):
         
         self.rms_norm_eps = config.rms_norm_eps
 #        self.attn_norm =  BitNetRMSNorm(hidden_size=self.output_last_size)
-        self.attn_norm = RMSNorm(hidden_size=self.output_last_size,eps=self.rms_norm_eps)
+        self.attn_sub_norm = RMSNorm(hidden_size=self.output_last_size,eps=self.rms_norm_eps)
         
         
         
@@ -289,7 +373,7 @@ class BitNetAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
                     
-        norm_output = self.attn_norm(attn_output)
+        norm_output = self.attn_sub_norm(attn_output)
                
         output, _ = self.o_proj(norm_output)
         
@@ -697,7 +781,7 @@ class BitNetForCausalLM(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:   #  iii
                 if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
                     # Handle pp weight tying here
                     # find the embed_tokens.weight in the weights
@@ -721,7 +805,7 @@ class BitNetForCausalLM(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                weight_loader(param, loaded_weight, shard_id)  # iii
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
