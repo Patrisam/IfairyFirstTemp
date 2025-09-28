@@ -88,66 +88,31 @@ def quant_dequant_input(x):
     return y
  
 
- 
+
 class Bit_MergedColumnParallelLinear(MergedColumnParallelLinear):
     def __init__(self, input_size, output_sizes, bias = True, gather_output = False, skip_bias_add = False, params_dtype = None, quant_config = None, prefix = "", tp_rank = None, tp_size = None, use_presharded_weights = False,threshold: float = 1.0):
         super().__init__(input_size, output_sizes, bias, gather_output, skip_bias_add, params_dtype, quant_config, prefix, tp_rank, tp_size, use_presharded_weights)
-        self.register_buffer('weight_scale', torch.empty(len(self.output_sizes), dtype=self.weight.dtype, device=self.weight.device))
-    def weight_loader(self, param, loaded_weight, loaded_shard_id = None):
-        # 如果是 scale，我们自己处理这个标量
-        if param is self.weight_scale:
-            param.data[loaded_shard_id] = loaded_weight.item()
-        # 否则 (是 weight 或 bias), 交给父类处理
-        else:
-            super().weight_loader(param, loaded_weight, loaded_shard_id)
     def forward(self, input_):
-        ori_weight = self.weight.data
-        tp_output_sizes = [size // self.tp_size for size in self.output_sizes]
-        expanded_scale = torch.repeat_interleave(
-            self.weight_scale.data,
-            torch.tensor(tp_output_sizes, device=self.weight.device)
-        ) 
-        quantized_weight = expanded_scale.unsqueeze(1)
-        
-        self.weight.data =  quantized_weight *ori_weight
-        input_ = quant_dequant_input(input_) 
-        output = super().forward(input_)
-        self.weight.data = ori_weight
-        return output 
+        input_ = quant_dequant_input(input_)              
+        return super().forward(input_)  
 
 
 class Bit_RowParallelLinear(RowParallelLinear):
     def __init__(self, input_size, output_size, bias = True, input_is_parallel = True, skip_bias_add = False, params_dtype = None, reduce_results = True, quant_config = None, prefix = "", tp_rank = None, tp_size = None, use_presharded_weights = False):
-        super().__init__(input_size, output_size, bias, input_is_parallel, skip_bias_add, params_dtype, reduce_results, quant_config, prefix, tp_rank, tp_size, use_presharded_weights)
-        self.register_buffer('weight_scale', torch.empty(1, dtype=self.weight.dtype,  device=self.weight.device))       
-    def weight_loader(self, param, loaded_weight):
-        if param is self.weight_scale:
-            param.data[0] = loaded_weight.item()
-        else:
-            super().weight_loader(param, loaded_weight)
-    def forward(self, input_):  
-        ori_weight = self.weight.data
-        scale_value = self.weight_scale.data        
-        self.weight.data = scale_value * ori_weight     
-        input_ = quant_dequant_input(input_)        
-        output, output_bias = super().forward(input_)       
-        self.weight.data = ori_weight       
-        return output, output_bias
-        return output 
+        super().__init__(input_size, output_size, bias, input_is_parallel, skip_bias_add, params_dtype, reduce_results, quant_config, prefix, tp_rank, tp_size, use_presharded_weights)    
+    def forward(self, input_):            
+        input_ = quant_dequant_input(input_)              
+        return super().forward(input_) 
 
 class Bit_QKVParallelLinear (QKVParallelLinear):
     def __init__(self, hidden_size, head_size, total_num_heads, total_num_kv_heads = None, bias = True, skip_bias_add = False, params_dtype = None, quant_config = None, prefix = "", tp_rank = None, tp_size = None, load_presharded_attn = False):
         super().__init__(hidden_size, head_size, total_num_heads, total_num_kv_heads, bias, skip_bias_add, params_dtype, quant_config, prefix, tp_rank, tp_size, load_presharded_attn)
     def forward(self, input_):
-        ori_weight = self.weight.data
-        quantized_weight = self.weight_scale.data 
-        self.weight.data =  quantized_weight *ori_weight
-        input_ = quant_dequant_input(input_) 
-        output = super().forward(input_)
-        return output 
+        input_ = quant_dequant_input(input_)              
+        return super().forward(input_) 
 
 
- 
+
 
 class Relu2AndMul(CustomOp) :
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
@@ -211,14 +176,14 @@ class BitNetMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj = Bit_MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = Bit_RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
@@ -251,7 +216,7 @@ class BitNetMLP(nn.Module):
         return x
 
 
-
+'''
 class BitNetRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-5):
         """
@@ -270,7 +235,7 @@ class BitNetRMSNorm(nn.Module):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
+'''
 
 class BitNetAttention(nn.Module):
     def __init__(
@@ -327,7 +292,7 @@ class BitNetAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = Bit_QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
@@ -336,7 +301,7 @@ class BitNetAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = Bit_RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
