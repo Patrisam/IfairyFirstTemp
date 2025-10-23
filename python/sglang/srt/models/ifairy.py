@@ -20,14 +20,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from torch import Tensor
 
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.activation import Relu2AndMul
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -52,17 +51,13 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import add_prefix, make_layers
 
-IfairyCOnfig =None
+iFairyConfig = None
+
 
 logger = logging.getLogger(__name__)
 
+class iFairyMLP(nn.Module):
 
-import torch
-import torch.nn as nn
-from torch import Tensor
-from typing import Optional
-
-class IfairyMLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -70,162 +65,237 @@ class IfairyMLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        eps: float = 1e-6
     ) -> None:
         super().__init__()
-
-        # 线性变换：gate_up_proj 和 up_proj
-        self.gate_proj = MergedColumnParallelLinear(
+        self.up_proj_real = ColumnParallelLinear(
             hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
+            intermediate_size,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("up_proj", prefix),
         )
-        self.down_proj = RowParallelLinear(
+        self.up_proj_imag = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("up_proj_imag", prefix),
+        )
+        self.gate_proj_real = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_proj_real", prefix),
+        )
+        self.gate_proj_imag = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_proj_imag", prefix),
+        )
+        self.down_proj_real = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
+            prefix=add_prefix("down_proj_real", prefix),
+        )
+        self.down_proj_imag = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("down_proj_imag", prefix),
         )
 
-        # 激活函数：ReLU²
-        if hidden_act != "relu2":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only relu2 is supported for now."
-            )
-        self.act_fn = ReLU2()
+        self.mlp_sub_norm = iFairyRMSNorm(hidden_size, eps=eps)
 
-        # 正则化层：ComplexNetRMSNorm (复数版本的 RMSNorm)
-        self.mlp_norm = ComplexNetRMSNorm(intermediate_size, eps=1e-6)
+        if hidden_act == "relu2":
+            self.act_fn = self._iFairy_ReLU2()
+        else:   
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only relu2 is supported for now.")
 
-    def forward(self, x_real: Tensor, x_imag: Tensor) -> Tensor:
-        # 线性变换：gate_up_proj
-        gate_proj_real, gate_proj_imag = self.gate_proj(x_real, x_imag)
+    def forward(self, x_real, x_imag):
+        up_x_real = self.up_proj_real(x_real) + self.up_proj_imag(x_imag)
+        up_x_imag = self.up_proj_imag(x_real) - self.up_proj_real(x_imag)
 
-        # 激活函数：复数 ReLU²
-        activated_real, activated_imag = self.act_fn(gate_proj_real, gate_proj_imag)
+        gate_x_real = self.gate_proj_real(x_real) + self.gate_proj_imag(x_imag)
+        gate_x_imag = self.gate_proj_imag(x_real) - self.gate_proj_real(x_imag)
 
-        # 线性变换：up_proj
-        up_proj_real, up_proj_imag = self.up_proj(x_real, x_imag)
+        act_x_real, act_x_imag = self.act_fn(gate_x_real, gate_x_imag)
+        up_act_x_real = (act_x_real * up_x_real + act_x_imag * up_x_imag)
+        up_act_x_imag = (act_x_real * up_x_imag - act_x_imag * up_x_real)
 
-        # ReLU² 门控后的融合操作（复数乘法）
-        up_proj_activated_real = (
-            activated_real * up_proj_real + activated_imag * up_proj_imag
-        )
-        up_proj_activated_imag = (
-            activated_real * up_proj_imag - activated_imag * up_proj_real
-        )
+        ln_up_act_x_real, ln_up_act_x_imag = self.mlp_sub_norm(up_act_x_real, up_act_x_imag)
 
-        # 使用复数正则化：ComplexNetRMSNorm
-        ln_real, ln_imag = self.mlp_norm(up_proj_activated_real, up_proj_activated_imag)
+        down_x_real = self.down_proj_real(ln_up_act_x_real) + self.down_proj_imag(ln_up_act_x_imag)
+        down_x_imag = self.down_proj_imag(ln_up_act_x_real) - self.down_proj_real(ln_up_act_x_imag)
+        return down_x_real, down_x_imag
 
-        # 线性变换：down_proj
-        out_real, out_imag = self.down_proj(ln_real, ln_imag)
+    def _iFairy_ReLU2(
+        self, 
+        x_real: torch.Tensor, 
+        x_imag: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        dead_mask = torch.logical_and(x_real < 0, x_imag < 0)
+        x_real[dead_mask] = 0
+        x_imag[dead_mask] = 0
 
-        return out_real, out_imag
+        x_real = torch.pow(x_real, 2)
+        x_imag = torch.pow(x_imag, 2)
+        return x_real, x_imag
 
-class ComplexNetRMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight_real = nn.Parameter(torch.ones(hidden_size))
-        self.weight_imag = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(
-        self, hidden_states_real: torch.Tensor, hidden_states_imag: torch.Tensor
-    ):
-        input_dtype = hidden_states_real.dtype
-
-        hidden_states_real.to(torch.float32)
-        hidden_states_imag.to(torch.float32)
-        magnitude = torch.mean(
-            hidden_states_real**2 + hidden_states_imag**2, dim=-1, keepdim=True
-        )
-        variance = torch.rsqrt(magnitude + self.variance_epsilon)
-
-        hidden_states_real = hidden_states_real * variance
-        hidden_states_imag = hidden_states_imag * variance
-
-        rmsnorm_out_real = self.weight_real * hidden_states_real
-        rmsnorm_out_imag = self.weight_imag * hidden_states_imag
-
-        return rmsnorm_out_real.to(input_dtype), rmsnorm_out_imag.to(input_dtype)
-
-
-class IfairyAttention(nn.Module):
+class ComplexNetRotaryEmbedding(nn.Module):
     def __init__(
         self,
+        rope_theta: float,
+        hidden_size: int,
+        num_attention_heads: int,
+        max_position_embeddings: int,
+    ):
+        super().__init__()
+        self.base = rope_theta
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.max_seq_len_cached = max_position_embeddings
+
+        inv_freq = self._compute_inv_freq()
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _compute_inv_freq(self):
+        head_dim = self.hidden_size // self.num_attention_heads
+        # 用 float32 防止整型参与幂运算
+        t = torch.arange(0, head_dim, dtype=torch.float32)
+        inv_freq = 1.0 / (self.base ** (t / head_dim))  # [D]
+        return inv_freq
+
+    @torch.no_grad()
+    def forward(self, position_ids: torch.Tensor, hidden_states_type: torch.dtype):
+        batch_size = position_ids.shape[0]
+        position_ids = position_ids[:, None, :].to(torch.float32)
+
+        if self.inv_freq.dim() == 1:
+            self.inv_freq = (
+                self.inv_freq[None, :, None]
+                .expand(batch_size, -1, 1)
+                .to(position_ids.device)
+            )
+
+        if position_ids.shape[0] > self.max_seq_len_cached:
+            print("Truncate position_ids within max_seq_len_cached.")
+            position_ids = position_ids[: self.max_seq_len_cached]
+
+        theta = (self.inv_freq.to(position_ids.dtype) @ position_ids).transpose(1, 2)
+        cos_emb = torch.cos(theta).to(hidden_states_type)
+        sin_emb = torch.sin(theta).to(hidden_states_type)
+        return cos_emb, sin_emb
+
+def _apply_rotary_pos_emb(
+    q_real: torch.Tensor,
+    q_imag: torch.Tensor,
+    k_real: torch.Tensor,
+    k_imag: torch.Tensor,
+    cos_emb: torch.Tensor,
+    sin_emb: torch.Tensor,
+) -> tuple:
+
+    def _apply_rotation(
+        x_real: torch.Tensor,
+        x_imag: torch.Tensor,
+        cos_emb: torch.Tensor,
+        sin_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        cos_emb = cos_emb.unsqueeze(1)
+        sin_emb = sin_emb.unsqueeze(1)
+
+        rotated_x_real = x_real * cos_emb - x_imag * sin_emb
+        rotated_x_imag = x_real * sin_emb + x_imag * cos_emb
+
+        return rotated_x_real, rotated_x_imag
+
+    rotated_q_real, rotated_q_imag = _apply_rotation(q_real, q_imag, cos_emb, sin_emb)
+    rotated_k_real, rotated_k_imag = _apply_rotation(k_real, k_imag, cos_emb, sin_emb)
+
+    return rotated_q_real, rotated_q_imag, rotated_k_real, rotated_k_imag
+
+class iFairyAttention(nn.Module):
+    
+    def __init__(
+        self,
+        config: iFairyConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
         head_dim: Optional[int] = None,
-        layer_id: int = 0,
         rope_theta: float = 1000000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 32768,
-        quant_config: Optional[QuantizationConfig] = None,
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
+        attn_dropout_p: float = 0.0,
+        quant_config: Optional["QuantizationConfig"] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
+ 
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
+
         self.total_num_kv_heads = num_kv_heads
         if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
             assert self.total_num_kv_heads % tp_size == 0
         else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        if head_dim is not None:
-            self.head_dim = head_dim
-        else:
-            self.head_dim = hidden_size // self.total_num_heads
+
+        self.head_dim = head_dim if head_dim is not None else hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
-        self.max_position_embeddings = max_position_embeddings
-
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
+        self.scaling = self.head_dim ** -0.5
+        self.qkv_proj_real = QKVParallelLinear(
+            hidden_size, 
+            self.head_dim, 
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
+            quant_config=quant_config, 
+            prefix=add_prefix("qkv_proj_real", prefix)
         )
-        self.o_proj = RowParallelLinear(
+        self.qkv_proj_imag = QKVParallelLinear(
+            hidden_size, 
+            self.head_dim, 
+            self.total_num_heads, 
+            self.total_num_kv_heads,
+            bias=True,
+            quant_config=quant_config, 
+            prefix=add_prefix("qkv_proj_imag", prefix)
+        )
+        self.o_proj_real = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False, 
+            quant_config=quant_config,
+            prefix=add_prefix("o_proj_real", prefix)
+        )
+        self.o_proj_imag = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("o_proj", prefix),
+            prefix=add_prefix("o_proj_imag", prefix)
         )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            dual_chunk_attention_config=dual_chunk_attention_config,
+        self.rotary_emb = ComplexNetRotaryEmbedding(
+            rope_theta=rope_theta,
+            hidden_size=self.hidden_size,
+            num_attention_heads=self.total_num_heads,   # 注意用 total_num_heads
+            max_position_embeddings=max_position_embeddings,
         )
+        
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -238,29 +308,56 @@ class IfairyAttention(nn.Module):
 
     def forward(
         self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        positions: torch.Tensor,        # [B, S]
+        hidden_states: torch.Tensor,    # [B, S, hidden_size]
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # Use the QKVParallelLinear for the projection
-        qkv, _ = self.qkv_proj(hidden_states)  # Using the complex QKV projection
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
-        return output
+        B, S, _ = hidden_states.shape
 
+    # 1) QKV（实/虚）投影并切分
+        qkv_real, _ = self.qkv_proj_real(hidden_states)  # [B, S, q_size + 2*kv_size]（按你的split）
+        qkv_imag, _ = self.qkv_proj_imag(hidden_states)
 
-class IfairyDecoderLayer(nn.Module):
+        q_real, k_real, v_real = qkv_real.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q_imag, k_imag, v_imag = qkv_imag.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # 2) reshape 成 [B, S, H, D] / [B, S, kvH, D]
+        def to_heads(x, n_h):
+            return x.view(B, S, n_h, self.head_dim)
+
+        q_real = to_heads(q_real, self.num_heads)
+        q_imag = to_heads(q_imag, self.num_heads)
+        k_real = to_heads(k_real, self.num_kv_heads)
+        k_imag = to_heads(k_imag, self.num_kv_heads)
+        v_real = to_heads(v_real, self.num_kv_heads)
+        v_imag = to_heads(v_imag, self.num_kv_heads)
+
+    # 3) 计算 cos/sin 并对 Q/K 施加旋转
+        cos_emb, sin_emb = self.rotary_emb(positions, hidden_states.dtype)  # [B,S,D]
+    # _apply_rotary_pos_emb 会把 cos/sin 扩到 [B,1,S,D]，自动广播到 head 维
+        q_r, q_i, k_r, k_i = _apply_rotary_pos_emb(
+            q_real=q_r, q_imag=q_i, k_real=k_r, k_imag=k_i,
+            cos_emb=cos_emb, sin_emb=sin_emb
+        )
+        
+        attn_out_real, attn_out_imag = self.attn(q_r, q_i, k_r, k_i, v_r, v_i, forward_batch)
+        attn_out_real = attn_out_real.reshape(B, S, self.num_heads * self.head_dim)
+        attn_out_imag = attn_out_imag.reshape(B, S, self.num_heads * self.head_dim)
+        o_real, _ = self.o_proj_real(attn_out_real)
+        o_imag, _ = self.o_proj_imag(attn_out_imag)
+        return o_real,o_imag
+    
+class iFairyDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: IfairyConfig,
+        config: iFairyNetConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
+        self.config =config
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -269,7 +366,9 @@ class IfairyDecoderLayer(nn.Module):
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
-        self.self_attn = IfairyAttention(
+        
+        self.self_attn = iFairyAttention(
+            config= self.config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -282,7 +381,8 @@ class IfairyDecoderLayer(nn.Module):
             dual_chunk_attention_config=dual_chunk_attention_config,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = IfairyMLP(
+        self.mlp = iFairyMLP(
+            config = self.config,
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -317,15 +417,14 @@ class IfairyDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
-
-
-class IfairyModel(nn.Module):
+    
+class iFairyModel(nn.Module):
     def __init__(
         self,
-        config: IfairyConfig,
+        config: iFairyConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        decoder_layer_type: type[nn.Module] = IfairyDecoderLayer,
+        decoder_layer_type: type[nn.Module] = iFairyDecoderLayer,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
@@ -345,8 +444,8 @@ class IfairyModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        # Use the provided decoder layer type or default to IfairyDecoderLayer
-        decoder_layer_type = decoder_layer_type or IfairyDecoderLayer
+        # Use the provided decoder layer type or default to Qwen2DecoderLayer
+        decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
@@ -450,9 +549,8 @@ class IfairyModel(nn.Module):
                 raise RuntimeError(
                     "Self attention has no KV cache scaling " "factor attribute!"
                 )
-
-
-class IfairyForCausalLM(nn.Module):
+    
+class iFairyForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -474,7 +572,7 @@ class IfairyForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: IfairyConfig,
+        config: BitNetConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -482,7 +580,7 @@ class IfairyForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = IfairyModel(
+        self.model = BitNetModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
@@ -642,7 +740,7 @@ class IfairyForCausalLM(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:   #  iii
                 if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
                     # Handle pp weight tying here
                     # find the embed_tokens.weight in the weights
@@ -666,7 +764,7 @@ class IfairyForCausalLM(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                weight_loader(param, loaded_weight, shard_id)  # iii
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -712,4 +810,5 @@ class IfairyForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-EntryClass = IfairyForCausalLM
+
+EntryClass = iFairyForCausalLM
