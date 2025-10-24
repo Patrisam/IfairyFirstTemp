@@ -73,7 +73,7 @@ class iFairyMLP(nn.Module):
             intermediate_size,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("up_proj", prefix),
+            prefix=add_prefix("up_proj_real", prefix),
         )
         self.up_proj_imag = ColumnParallelLinear(
             hidden_size,
@@ -426,9 +426,11 @@ class iFairyDecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        hidden_states_real, residual_real = self.post_attention_layernorm(hidden_states_real, residual_real)
+        hidden_states_imag, residual_imag = self.post_attention_layernorm(hidden_states_imag, residual_imag)
+        hidden_states_real = self.mlp(hidden_states_real)
+        hidden_states_imag = self.mlp(hidden_states_imag)
+        return hidden_states_real, hidden_states_imag,residual_real,residual_imag
     
 class iFairyModel(nn.Module):
     def __init__(
@@ -457,7 +459,7 @@ class iFairyModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         # Use the provided decoder layer type or default to Qwen2DecoderLayer
-        decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
+        decoder_layer_type = decoder_layer_type or iFairyDecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
@@ -620,7 +622,7 @@ class iFairyForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: BitNetConfig,
+        config: iFairyConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -628,7 +630,7 @@ class iFairyForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = BitNetModel(
+        self.model = iFairyModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
