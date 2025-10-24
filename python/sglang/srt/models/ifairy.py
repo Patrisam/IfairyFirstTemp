@@ -397,19 +397,31 @@ class iFairyDecoderLayer(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states_real: torch.Tensor,
+        hidden_states_imag:torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
+        residual_real: Optional[torch.Tensor],
+        residual_imag:Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+        if residual_real is None:
+            residual_real = hidden_states_real
+            hidden_states_real = self.input_layernorm(hidden_states_real)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
+            hidden_states_real, residual_real = self.input_layernorm(hidden_states_real, residual_real)
+        if residual_imag is None:
+            residual_imag = hidden_states_imag
+            hidden_states_imag = self.input_layernorm(hidden_states_imag)
+        else:
+            hidden_states_imag, residual_imag = self.input_layernorm(hidden_states_imag, residual_imag)
+        hidden_states_real = self.self_attn(
             positions=positions,
-            hidden_states=hidden_states,
+            hidden_states_real=hidden_states_real,
+            forward_batch=forward_batch,
+        )
+        hidden_states_imag = self.self_attn(
+            positions=positions,
+            hidden_states_imag=hidden_states_imag,
             forward_batch=forward_batch,
         )
 
@@ -486,46 +498,71 @@ class iFairyModel(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
             if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
+                hidden_states_real = self.embed_tokens(input_ids)
+                hidden_states_imag = self.embed_tokens(input_ids)
             else:
-                hidden_states = input_embeds
-            residual = None
+                hidden_states_real = input_embeds
+                hidden_states_imag = input_embeds
+            residual_real = None
+            residual_imag = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states_real = pp_proxy_tensors["hidden_states_real"]
+            hidden_states_imag = pp_proxy_tensors["hidden_states_imag"]
+            residual_real = pp_proxy_tensors["residual_real"]
+            residual_imag = pp_proxy_tensors["residual_imag"]
 
-        aux_hidden_states = []
+        aux_hidden_states_real = []
+        aux_hidden_states_imag = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
+                aux_hidden_states_real.append(
+                    hidden_states_real + residual_real if residual_real is not None else hidden_states_real
                 )
             layer = self.layers[i]
-            hidden_states, residual = layer(
+            hidden_states_real, residual_real = layer(
                 positions,
-                hidden_states,
+                hidden_states_real,
                 forward_batch,
-                residual,
+                residual_real,
+            )
+        for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states_imag.append(
+                    hidden_states_imag + residual_imag if residual_imag is not None else hidden_states_imag
+                )
+            layer = self.layers[i]
+            hidden_states_imag, residual_imag = layer(
+                positions,
+                hidden_states_imag,
+                forward_batch,
+                residual_imag,
             )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
+                    "hidden_states_real": hidden_states_real,
+                    "hidden_states_imag": hidden_states_imag,
+                    "residual_real": residual_real,
+                    "residual_imag": residual_imag,
                 }
             )
         else:
-            if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
+            if hidden_states_real.shape[0] != 0:
+                if residual_real is None:
+                    hidden_states_real = self.norm(hidden_states_real)
                 else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                    hidden_states_real, _ = self.norm(hidden_states_real, residual_real)
+            if hidden_states_imag.shape[0] != 0:
+                if residual_imag is None:
+                    hidden_states_imag = self.norm(hidden_states_imag)
+                else:
+                    hidden_states_imag, _ = self.norm(hidden_states_imag, residual_imag)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
+        if len(aux_hidden_states_real and aux_hidden_states_imag) == 0:
+            return hidden_states_real,hidden_states_imag
 
-        return hidden_states, aux_hidden_states
+        return hidden_states_real, hidden_states_imag, aux_hidden_states_real, aux_hidden_states_imag
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -542,32 +579,43 @@ class iFairyModel(nn.Module):
         ):
             if not isinstance(self.layers[layer_idx], nn.Identity):
                 layer_self_attn = self.layers[layer_idx].self_attn
-            if hasattr(layer_self_attn.attn, "k_scale"):
-                layer_self_attn.attn.k_scale = scaling_factor
-                layer_self_attn.attn.v_scale = scaling_factor
+            if hasattr(layer_self_attn.attn, "k_real_scale") and hasattr(layer_self_attn.attn, "k_imag_scale"):
+                # 这里确保 k_real_scale 和 k_imag_scale 都存在
+                layer_self_attn.attn.k_real_scale = scaling_factor
+                layer_self_attn.attn.v_real_scale = scaling_factor
+                layer_self_attn.attn.k_imag_scale = scaling_factor
+                layer_self_attn.attn.v_imag_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attributes (k_real_scale or k_imag_scale)!"
                 )
     
 class iFairyForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
-        ".gate_proj.",
-        ".down_proj.",
-        ".up_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
+        ".gate_proj_real.",
+        ".gate_proj_imag.",
+        ".down_proj_real.",
+        ".down_proj_imag.",
+        ".up_proj_real.",
+        ".up_proj_imag.",
+        ".q_proj_real.",
+        ".q_proj_imag.",
+        ".k_proj_real.",
+        ".k_proj_imag.",
+        ".v_proj_real.",
+        ".v_proj_imag.",
+        ".o_proj_real.",
+        ".o_proj_imag.",
     ]
     bitsandbytes_stacked_params_mapping = {
         # shard_name, weight_name, index
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
+        "q_proj_real": ("qkv_proj_real", 0),
+        "k_proj_real": ("qkv_proj_real", 1),
+        "v_proj_real": ("qkv_proj_real", 2),
+        "q_proj_imag": ("qkv_proj_imag", 0),
+        "k_proj_imag": ("qkv_proj_imag", 1),
+        "v_proj_imag": ("qkv_proj_imag", 2),
     }
 
     def __init__(
@@ -616,10 +664,8 @@ class iFairyForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # For EAGLE3 support
-        self.capture_aux_hidden_states = False
-
-        # For EAGLE3 support
-        self.capture_aux_hidden_states = False
+        self.capture_aux_hidden_states_real = False
+        self.capture_aux_hidden_states_imag = False
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embedding(input_ids)
@@ -637,30 +683,41 @@ class iFairyForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(
+        hidden_states_real = self.model(
             input_ids,
             positions,
             forward_batch,
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        hidden_states_imag = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        aux_hidden_states_real = None
+        aux_hidden_states_imag = None
+        if self.capture_aux_hidden_states_real and self.capture_aux_hidden_states_imag:
+            aux_hidden_states_real = hidden_states_real
+            aux_hidden_states_imag = hidden_states_imag
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
                     input_ids,
-                    hidden_states,
+                    hidden_states_real,
+                    hidden_states_imag,
                     self.lm_head,
                     forward_batch,
-                    aux_hidden_states,
+                    aux_hidden_states_real,
+                    aux_hidden_states_imag,
                 )
             else:
-                return self.pooler(hidden_states, forward_batch)
+                return self.pooler(hidden_states_real,hidden_states_imag, forward_batch)
         else:
-            return hidden_states
+            return hidden_states_real,hidden_states_imag
 
     @torch.no_grad()
     def forward_split_prefill(
@@ -681,26 +738,40 @@ class iFairyForCausalLM(nn.Module):
         # decoder layer
         for i in range(start, end):
             layer = self.model.layers[i]
-            forward_batch.hidden_states, forward_batch.residual = layer(
+            hidden_states_real, hidden_states_imag = forward_batch.hidden_states
+            residual_real, residual_imag = forward_batch.residual
+
+            hidden_states_real, hidden_states_imag, residual_real, residual_imag = layer(
                 positions,
-                forward_batch.hidden_states,
+                hidden_states_real, hidden_states_imag,
                 forward_batch,
-                forward_batch.residual,
+                residual_real, residual_imag,
             )
+            forward_batch.hidden_states = (hidden_states_real, hidden_states_imag)
+            forward_batch.residual = (residual_real, residual_imag)
 
         if end == self.model.config.num_hidden_layers:
-            # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
+            # norm for real and imaginary parts
+            hidden_states_real, hidden_states_imag = forward_batch.hidden_states
+            residual_real, residual_imag = forward_batch.residual
+
+            # Normalize real and imaginary parts
+            hidden_states_real, hidden_states_imag = self.model.norm(
+                hidden_states_real, hidden_states_imag, residual_real, residual_imag
             )
-            forward_batch.hidden_states = hidden_states
-            # logits process
+
+            forward_batch.hidden_states = (hidden_states_real, hidden_states_imag)
+
+    # logits process for real and imaginary parts
             result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+                input_ids,
+                hidden_states_real, hidden_states_imag,
+                self.lm_head,
+                forward_batch
             )
         else:
             result = None
-
+            
         return result
 
     @property
@@ -714,11 +785,12 @@ class iFairyForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+            ("qkv_proj_real", "q_proj_real", "q"),
+            ("qkv_proj_real", "k_proj_real", "k"),
+            ("qkv_proj_real", "v_proj_real", "v"),
+            ("qkv_proj_imag", "q_proj_imag", "q"),
+            ("qkv_proj_imag", "k_proj_imag", "k"),
+            ("qkv_proj_imag", "v_proj_imag", "v"),
         ]
 
         params_dict = dict(self.named_parameters())
